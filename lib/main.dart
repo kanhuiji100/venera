@@ -281,6 +281,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 ),
               );
             }
+            // Windows 平板：点击输入框以外时让其失焦，避免触摸键盘被任意点击唤起
+            // （详见 utils/windows_touch_keyboard.dart）
+            widget = WindowsTouchKeyboard.wrap(widget);
             return _SystemUiProvider(Material(
               color: App.isLinux ? Colors.transparent : null,
               child: widget,
