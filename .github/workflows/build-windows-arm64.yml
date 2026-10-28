@@ -154,6 +154,31 @@ jobs:
           Write-Host "--- 冒烟测试 ---"
           & $files[0].FullName $cache
 
+          # ---- 2. rhttp 内置的 cargokit 版本过旧，target.dart 里没有 windows-arm64 映射 ----
+          # 不补的话 build_tool 会抛 "Unknown target platform: windows-arm64"
+          $targets = @(Get-ChildItem -Path $cache -Recurse -Filter 'target.dart' -File -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -like '*cargokit*build_tool*target.dart' })
+          if ($targets.Count -eq 0) { Write-Warning '未找到 cargokit 的 target.dart，跳过'; exit 0 }
+
+          $needle = "flutter: 'windows-x64',"
+          $close  = '    ),'
+          foreach ($t in $targets) {
+            $c = Get-Content $t.FullName -Raw
+            if ($c -match "windows-arm64") { Write-Host "已包含 windows-arm64: $($t.FullName)"; continue }
+            $i = $c.IndexOf($needle)
+            if ($i -lt 0) { Write-Warning "未找到 windows-x64 锚点: $($t.FullName)"; continue }
+            $j = $c.IndexOf($close, $i)
+            if ($j -lt 0) { Write-Warning "未找到块结尾: $($t.FullName)"; continue }
+            $nl = if ($c.Contains("`r`n")) { "`r`n" } else { "`n" }
+            $insert = "$nl    Target($nl      rust: 'aarch64-pc-windows-msvc',$nl      flutter: 'windows-arm64',$nl    ),"
+            $new = $c.Substring(0, $j + $close.Length) + $insert + $c.Substring($j + $close.Length)
+            Set-Content $t.FullName -Value $new -NoNewline
+            Write-Host "已补 aarch64-pc-windows-msvc 映射: $($t.FullName)"
+          }
+          foreach ($t in $targets) {
+            if ((Get-Content $t.FullName -Raw) -notmatch 'windows-arm64') { throw "target.dart 修补失败: $($t.FullName)" }
+          }
+
       - name: Rust 环境诊断与目标补齐
         shell: pwsh
         run: |
