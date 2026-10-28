@@ -247,6 +247,13 @@ jobs:
           if (-not $iscc) { Write-Warning '未找到 ISCC.exe，跳过安装包'; exit 0 }
           Write-Host "使用 $iscc"
 
+          # build_arm64.iss 引用了中文语言文件，上游脚本是运行时临时下载的（仓库里没有）
+          $isl = 'windows\ChineseSimplified.isl'
+          if (-not (Test-Path $isl)) {
+            Invoke-WebRequest 'https://cdn.jsdelivr.net/gh/kira-96/Inno-Setup-Chinese-Simplified-Translation@latest/ChineseSimplified.isl' -OutFile $isl
+            Write-Host "已下载 $isl ($((Get-Item $isl).Length) 字节)"
+          }
+
           $ver = $env:VERSION
           $iss = 'windows\build_arm64.iss'
           $orig = Get-Content $iss -Raw
