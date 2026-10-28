@@ -154,11 +154,28 @@ jobs:
           Write-Host "--- 冒烟测试 ---"
           & $files[0].FullName $cache
 
+      - name: Rust 环境诊断与目标补齐
+        shell: pwsh
+        run: |
+          Write-Host "--- rustc ---"
+          rustc -vV
+          Write-Host "--- rustup show ---"
+          rustup show
+          Write-Host "--- 已安装 target ---"
+          rustup target list --installed
+          Write-Host "--- link.exe ---"
+          (Get-Command link.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "--- 补齐 aarch64-pc-windows-msvc ---"
+          rustup target add aarch64-pc-windows-msvc 2>&1 | ForEach-Object { $_.ToString() }
+          rustup target list --installed
+
       - name: flutter build windows --release
         shell: pwsh
         run: |
           $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
-          flutter build windows --release
+          # -v 以便看到 cargokit / cargo 的真实输出（MSBuild 默认会吞掉自定义命令的 stdout）
+          flutter build windows --release -v 2>&1 | Tee-Object -FilePath build-verbose.log
+          if ($LASTEXITCODE -ne 0) { throw "flutter build 失败，退出码 $LASTEXITCODE" }
           Write-Host "--- 产物目录 ---"
           Get-ChildItem build\windows -Directory | Select-Object -ExpandProperty Name
 
