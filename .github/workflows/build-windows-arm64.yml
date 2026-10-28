@@ -45,46 +45,55 @@ jobs:
             throw "运行器不是原生 ARM64，无法产出 ARM64 构建"
           }
 
-      - name: 下载 Flutter SDK 并解压
+      - name: 缓存 Flutter SDK 与 pub 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\flutter_sdk
+            C:\Users\runneradmin\AppData\Local\Pub\Cache
+          key: arm64-flutter-${{ inputs.flutter_version }}-dart-${{ inputs.dart_version }}-v2
+
+      - name: 准备 Flutter SDK（换入原生 arm64 Dart）
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $v   = "${{ inputs.flutter_version }}"
-          $zip = Join-Path $env:RUNNER_TEMP "flutter_windows_$v.zip"
-          $url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$v-stable.zip"
-          Write-Host "下载 $url"
-          Invoke-WebRequest $url -OutFile $zip
-          Write-Host ("大小 {0:N0} MB" -f ((Get-Item $zip).Length / 1MB))
-          # 用 bsdtar 解压，比 Expand-Archive 快得多
-          tar -xf $zip -C "C:\"
-          if (Test-Path $env:FLUTTER_HOME) { Remove-Item -Recurse -Force $env:FLUTTER_HOME }
-          Move-Item "C:\flutter" $env:FLUTTER_HOME
-          Get-Content "$env:FLUTTER_HOME\version" -ErrorAction SilentlyContinue
+          $flutterV = "${{ inputs.flutter_version }}"
+          $dartV    = "${{ inputs.dart_version }}"
+          $cache    = Join-Path $env:FLUTTER_HOME 'bin\cache'
+          $dartExe  = Join-Path $cache 'dart-sdk\bin\dart.exe'
 
-      - name: 换成原生 arm64 Dart SDK
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dart  = "${{ inputs.dart_version }}"
-          $cache = Join-Path $env:FLUTTER_HOME 'bin\cache'
+          if ((Test-Path (Join-Path $env:FLUTTER_HOME 'version')) -and (Test-Path $dartExe)) {
+            Write-Host "命中缓存，跳过下载。SDK 版本: $((Get-Content (Join-Path $env:FLUTTER_HOME 'version') -Raw).Trim())"
+          } else {
+            $zip = Join-Path $env:RUNNER_TEMP "flutter_windows_$flutterV.zip"
+            $url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$flutterV-stable.zip"
+            Write-Host "下载 $url"
+            Invoke-WebRequest $url -OutFile $zip
+            Write-Host ("大小 {0:N0} MB" -f ((Get-Item $zip).Length / 1MB))
+            tar -xf $zip -C "C:\"          # 解压出 C:\flutter
+            if (Test-Path $env:FLUTTER_HOME) { Remove-Item -Recurse -Force $env:FLUTTER_HOME }
+            Move-Item "C:\flutter" $env:FLUTTER_HOME
 
-          # 旧的 flutter_tools 快照是 x64 的 app-jit 快照，arm64 VM 无法加载，必须删掉让它重建
-          Remove-Item -Force -ErrorAction SilentlyContinue `
-            (Join-Path $cache 'flutter_tools.snapshot'), (Join-Path $cache 'flutter_tools.stamp')
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $cache 'dart-sdk')
+            # 旧的 flutter_tools 快照是 x64 的 app-jit 快照，arm64 VM 无法加载，必须删掉让它重建
+            Remove-Item -Force -ErrorAction SilentlyContinue `
+              (Join-Path $cache 'flutter_tools.snapshot'), (Join-Path $cache 'flutter_tools.stamp')
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $cache 'dart-sdk')
 
-          $zip = Join-Path $env:RUNNER_TEMP "dartsdk-$dart-arm64.zip"
-          Invoke-WebRequest "https://storage.googleapis.com/dart-archive/channels/stable/release/$dart/sdk/dartsdk-windows-arm64-release.zip" -OutFile $zip
-          # 归档根目录就是 dart-sdk/，解到 cache 下即可
-          tar -xf $zip -C $cache
+            $dartZip = Join-Path $env:RUNNER_TEMP "dartsdk-$dartV-arm64.zip"
+            Invoke-WebRequest "https://storage.googleapis.com/dart-archive/channels/stable/release/$dartV/sdk/dartsdk-windows-arm64-release.zip" -OutFile $dartZip
+            # 归档根目录就是 dart-sdk/，解到 cache 下即可
+            tar -xf $dartZip -C $cache
 
-          # 把缓存戳写成引擎版本号，否则启动脚本会认为 Dart SDK 过期而重新拉取 x64 版本
-          $engine = (Get-Content (Join-Path $env:FLUTTER_HOME 'bin\internal\engine.version') -Raw).Trim()
-          Set-Content (Join-Path $cache 'engine.stamp')        -Value $engine -NoNewline -Encoding ascii
-          Set-Content (Join-Path $cache 'engine-dart-sdk.stamp') -Value $engine -NoNewline -Encoding ascii
+            # 把缓存戳写成引擎版本号，否则启动脚本会认为 Dart SDK 过期而重新拉取 x64 版本
+            $engine = (Get-Content (Join-Path $env:FLUTTER_HOME 'bin\internal\engine.version') -Raw).Trim()
+            Set-Content (Join-Path $cache 'engine.stamp')          -Value $engine -NoNewline -Encoding ascii
+            Set-Content (Join-Path $cache 'engine-dart-sdk.stamp') -Value $engine -NoNewline -Encoding ascii
+          }
 
-          Write-Host "--- dart 自身架构 ---"
-          & (Join-Path $cache 'dart-sdk\bin\dart.exe') --version
+          # 硬校验：flutter 工具的架构判定完全依赖这个 dart.exe，必须是 windows_arm64
+          $out = (& $dartExe --version 2>&1) -join ' '
+          Write-Host "dart: $out"
+          if ($out -notmatch 'windows_arm64') { throw "Dart SDK 不是 windows_arm64，架构判定会退化成 x64：$out" }
 
       - name: 初始化 flutter（重建工具快照 + 预取 arm64 引擎产物）
         shell: pwsh
@@ -122,7 +131,7 @@ jobs:
         run: |
           # cargokit 的 cmake/resolve_symlinks.ps1 逐个路径段调用 Get-Item，但 Windows 下
           # 对隐藏目录（如 C:\Users\<user>\AppData）不加 -Force 就会抛 "找不到项"，
-          # 导致 rhttp_cargokit 的自定义构建以 -1 退出。这里改成带 -Force 且容错的写法。
+          # 导致 rhttp_cargokit 的自定义构建以 -1 退出。
           $ErrorActionPreference = 'Stop'
           $cache = if ($env:PUB_CACHE) { $env:PUB_CACHE } else { Join-Path $env:LOCALAPPDATA 'Pub\Cache' }
           Write-Host "PUB_CACHE = $cache"
@@ -141,21 +150,19 @@ jobs:
             Write-Host "已修补: $($f.FullName)"
           }
 
-          # 冒烟测试：用包含隐藏目录的路径跑一遍，确认不再报错且能输出路径
-          $probe = & $files[0].FullName $cache
-          Write-Host "冒烟测试结果: [$probe]"
-          if (-not $probe) { throw 'resolve_symlinks.ps1 修补后仍无法解析路径' }
+          # 冒烟测试：脚本用 Write-Host 输出，直接让它打进日志（不要用管道捕获）
+          Write-Host "--- 冒烟测试 ---"
+          & $files[0].FullName $cache
 
       - name: flutter build windows --release
         shell: pwsh
         run: |
           $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
           flutter build windows --release
-          Write-Host "--- 产物 ---"
+          Write-Host "--- 产物目录 ---"
           Get-ChildItem build\windows -Directory | Select-Object -ExpandProperty Name
 
       - name: 打包 zip 并校验 PE 架构
-        id: pack
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -187,14 +194,8 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $iscc = @(
-            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
-            'C:\Program Files\Inno Setup 6\ISCC.exe'
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $iscc) {
-            $iscc = (Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue |
-                     Select-Object -First 1).FullName
-          }
+          $iscc = (Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1).FullName
           if (-not $iscc) { Write-Warning '未找到 ISCC.exe，跳过安装包'; exit 0 }
           Write-Host "使用 $iscc"
 
