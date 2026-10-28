@@ -1,5 +1,7 @@
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "comctl32.lib")
 #include "flutter_window.h"
+#include <commctrl.h>
 #include <optional>
 #include <winhttp.h>
 #include <Windows.h>
@@ -49,6 +51,54 @@ FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
+
+// ---------------------------------------------------------------------------
+// 修复：Windows 平板（触屏、无物理键盘）上"点击窗口任意位置都会弹出触摸键盘"
+//
+// 成因（Flutter 引擎行为，见 flutter/flutter#99050）：
+//   引擎在 Flutter 视图窗口收到 WM_IME_SETCONTEXT 时，会调用
+//   TextInputManager::CreateImeWindow() 在该窗口上 ::CreateCaret() 创建一个系统光标；
+//   而这个光标只有收到 WM_IME_ENDCOMPOSITION（输入法组字结束）时才由
+//   DestroyImeWindow() 销毁。用户不打中文/不组字时，光标就永久挂在窗口上，
+//   Windows 的触摸键盘自动唤起逻辑（看 GetGUIThreadInfo().hwndCaret）因此把整个窗口
+//   当成文本编辑器，任何位置的触摸都会把触摸键盘(TabTip/SIP)唤出来。
+//
+// 处理：
+//   Dart 侧（lib/utils/windows_touch_keyboard.dart）把"当前是否正在编辑文本"同步过来。
+//   - 不在编辑：销毁系统光标，触摸键盘不再被任意点击唤起；
+//   - 进入编辑：补回系统光标（等价于引擎的 CreateImeWindow），触摸键盘照常可用。
+// ---------------------------------------------------------------------------
+namespace {
+
+HWND g_view_hwnd = nullptr;
+std::atomic<bool> g_text_editing(false);
+
+// 建立/销毁系统光标，从而让 Windows 认为/不认为当前窗口是文本编辑器。
+void SetImeCaret(bool enabled) {
+  HWND hwnd = g_view_hwnd;
+  if (hwnd == nullptr) {
+    return;
+  }
+  if (enabled) {
+    // 与引擎 TextInputManager::CreateImeWindow() 相同的调用
+    ::CreateCaret(hwnd, nullptr, 1, 1);
+  } else {
+    ::DestroyCaret();
+  }
+}
+
+LRESULT CALLBACK SuppressImeCaretProc(HWND hwnd, UINT message, WPARAM wparam,
+                                      LPARAM lparam, UINT_PTR subclass_id,
+                                      DWORD_PTR ref_data) {
+  // 先让引擎处理消息（保留它对 IME 组合窗口标志的处理），再按需清掉它创建的光标
+  LRESULT result = DefSubclassProc(hwnd, message, wparam, lparam);
+  if (message == WM_IME_SETCONTEXT && wparam != 0 && !g_text_editing.load()) {
+    ::DestroyCaret();
+  }
+  return result;
+}
+
+}  // namespace
 
 void monitorUIThread() {
     const auto timeout = std::chrono::seconds(5);
@@ -177,7 +227,37 @@ bool FlutterWindow::OnCreate() {
       }
   });
 
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  HWND view_hwnd = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(view_hwnd);
+
+  // 见上方 SuppressImeCaretProc：抑制平板触摸键盘的自动唤起
+  if (view_hwnd != nullptr) {
+    g_view_hwnd = view_hwnd;
+    SetWindowSubclass(view_hwnd, SuppressImeCaretProc, 1, 0);
+    // 引擎在窗口创建早期就可能已建立 IME 上下文，这里兜底清一次
+    ::DestroyCaret();
+  }
+
+  // Dart 侧同步"是否正在编辑文本"，用于控制上面那个系统光标
+  const flutter::MethodChannel<> osk_channel(
+      flutter_controller_->engine()->messenger(), "venera/osk",
+      &flutter::StandardMethodCodec::GetInstance());
+  osk_channel.SetMethodCallHandler(
+      [](const flutter::MethodCall<>& call,
+         const std::unique_ptr<flutter::MethodResult<>>& result) {
+        if (call.method_name() == "setEditing") {
+          const auto* editing = std::get_if<bool>(call.arguments());
+          if (editing == nullptr) {
+            result->Error("bad_args", "setEditing expects a bool");
+            return;
+          }
+          g_text_editing = *editing;
+          SetImeCaret(*editing);
+          result->Success();
+          return;
+        }
+        result->Success();
+      });
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     // this->Show();
