@@ -196,8 +196,14 @@ jobs:
 
       - name: flutter build windows --release
         shell: pwsh
+        env:
+          # VS2026 (MSVC 14.51) 把 <experimental/coroutine>（C++/WinRT 间接引入）的弃用
+          # 从警告升级成了 error C2338 / STL1011，flutter_inappwebview、local_auth 会挂。
+          # _CL_ 是 MSVC 的"追加命令行参数"环境变量，cl.exe 会把它拼到每次编译后面。
+          _CL_: '/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS'
         run: |
           $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
+          Write-Host "_CL_ = $env:_CL_"
           # -v 以便看到 cargokit / cargo 的真实输出（MSBuild 默认会吞掉自定义命令的 stdout）
           flutter build windows --release -v 2>&1 | Tee-Object -FilePath build-verbose.log
           if ($LASTEXITCODE -ne 0) { throw "flutter build 失败，退出码 $LASTEXITCODE" }
