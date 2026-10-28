@@ -9,6 +9,7 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/auth_page.dart';
 import 'package:venera/pages/main_page.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/windows_touch_keyboard.dart';
 import 'package:window_manager/window_manager.dart';
 import 'components/components.dart';
 import 'components/window_frame.dart';
@@ -70,6 +71,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     App.registerForceRebuild(forceRebuild);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WidgetsBinding.instance.addObserver(this);
+    // 修复 Windows 平板触摸键盘在任意位置点击时乱弹（见 utils/windows_touch_keyboard.dart）
+    WindowsTouchKeyboard.install();
     checkUpdates();
     super.initState();
   }
