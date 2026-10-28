@@ -1,0 +1,203 @@
+name: Build Windows ARM64
+
+# 为什么需要这套流程：
+# flutter build windows 的目标架构不是命令行参数，而是由宿主架构硬编码决定的
+#   packages/flutter_tools/lib/src/commands/build_windows.dart
+#   => os.hostPlatform == HostPlatform.windows_arm64 ? windows-arm64 : windows-x64
+# 而 hostPlatform 在 Windows 上取自 Dart VM 的 Abi.current()，即"跑 flutter 工具的那个 dart.exe 的架构"。
+# 官方 Windows Flutter SDK 只发布 x64 版本，在 ARM64 机器上即使原生/模拟运行也只会报 windows_x64。
+# 因此：在原生 ARM64 运行器上，把 SDK 里的 dart-sdk 换成 dart-archive 的 windows-arm64 版本，
+#       并强制重建 flutter_tools 快照，flutter 才会走 -A ARM64 + windows-arm64 引擎产物。
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Flutter stable version (必须 >= 3.44，3.41/3.42/3.43 没有 windows-arm64 引擎产物)'
+        required: false
+        default: '3.44.9'
+      dart_version:
+        description: '该 Flutter 版本自带的 Dart SDK 版本（须与 Flutter 一致）'
+        required: false
+        default: '3.12.2'
+      build_installer:
+        description: '是否同时构建 Inno Setup 安装包'
+        required: false
+        default: 'true'
+
+env:
+  FLUTTER_HOME: C:\flutter_sdk
+
+jobs:
+  build:
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确认宿主是原生 ARM64
+        shell: pwsh
+        run: |
+          "PROCESSOR_ARCHITECTURE : $env:PROCESSOR_ARCHITECTURE"
+          "PROCESSOR_IDENTIFIER   : $env:PROCESSOR_IDENTIFIER"
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
+            throw "运行器不是原生 ARM64，无法产出 ARM64 构建"
+          }
+
+      - name: 下载 Flutter SDK 并解压
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v   = "${{ inputs.flutter_version }}"
+          $zip = Join-Path $env:RUNNER_TEMP "flutter_windows_$v.zip"
+          $url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$v-stable.zip"
+          Write-Host "下载 $url"
+          Invoke-WebRequest $url -OutFile $zip
+          Write-Host ("大小 {0:N0} MB" -f ((Get-Item $zip).Length / 1MB))
+          # 用 bsdtar 解压，比 Expand-Archive 快得多
+          tar -xf $zip -C "C:\"
+          if (Test-Path $env:FLUTTER_HOME) { Remove-Item -Recurse -Force $env:FLUTTER_HOME }
+          Move-Item "C:\flutter" $env:FLUTTER_HOME
+          Get-Content "$env:FLUTTER_HOME\version" -ErrorAction SilentlyContinue
+
+      - name: 换成原生 arm64 Dart SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dart  = "${{ inputs.dart_version }}"
+          $cache = Join-Path $env:FLUTTER_HOME 'bin\cache'
+
+          # 旧的 flutter_tools 快照是 x64 的 app-jit 快照，arm64 VM 无法加载，必须删掉让它重建
+          Remove-Item -Force -ErrorAction SilentlyContinue `
+            (Join-Path $cache 'flutter_tools.snapshot'), (Join-Path $cache 'flutter_tools.stamp')
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $cache 'dart-sdk')
+
+          $zip = Join-Path $env:RUNNER_TEMP "dartsdk-$dart-arm64.zip"
+          Invoke-WebRequest "https://storage.googleapis.com/dart-archive/channels/stable/release/$dart/sdk/dartsdk-windows-arm64-release.zip" -OutFile $zip
+          # 归档根目录就是 dart-sdk/，解到 cache 下即可
+          tar -xf $zip -C $cache
+
+          # 把缓存戳写成引擎版本号，否则启动脚本会认为 Dart SDK 过期而重新拉取 x64 版本
+          $engine = (Get-Content (Join-Path $env:FLUTTER_HOME 'bin\internal\engine.version') -Raw).Trim()
+          Set-Content (Join-Path $cache 'engine.stamp')        -Value $engine -NoNewline -Encoding ascii
+          Set-Content (Join-Path $cache 'engine-dart-sdk.stamp') -Value $engine -NoNewline -Encoding ascii
+
+          Write-Host "--- dart 自身架构 ---"
+          & (Join-Path $cache 'dart-sdk\bin\dart.exe') --version
+
+      - name: 初始化 flutter（重建工具快照 + 预取 arm64 引擎产物）
+        shell: pwsh
+        run: |
+          $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
+          "$env:FLUTTER_HOME\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          flutter --version
+          flutter config --no-analytics | Out-Null
+          # precache 会按宿主架构下载 windows-arm64 的 flutter_windows.dll / gen_snapshot 等
+          flutter precache --windows
+          Write-Host "--- 已缓存的 windows 引擎产物 ---"
+          Get-ChildItem "$env:FLUTTER_HOME\bin\cache\artifacts\engine" -Directory |
+            Where-Object Name -like 'windows*' | Select-Object -ExpandProperty Name
+
+      - name: 对齐 pubspec 的 Flutter 版本约束
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = "${{ inputs.flutter_version }}"
+          $c = Get-Content pubspec.yaml -Raw
+          # 注意：替换串必须用单引号拼接，双引号里的 ${1} 会被 PowerShell 当成变量展开
+          $new = [regex]::Replace($c, '(?m)^(\s+flutter:\s*)\d[\w.\-+]*\s*$', '${1}' + $v)
+          if ($new -eq $c) { Write-Warning '未找到 environment.flutter 版本约束，跳过' }
+          Set-Content pubspec.yaml -Value $new -NoNewline
+          Select-String pubspec.yaml -Pattern '^environment:' -Context 0,2
+
+      - name: flutter pub get
+        shell: pwsh
+        run: |
+          $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
+          flutter pub get
+
+      - name: flutter build windows --release
+        shell: pwsh
+        run: |
+          $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
+          flutter build windows --release
+          Write-Host "--- 产物 ---"
+          Get-ChildItem build\windows -Directory | Select-Object -ExpandProperty Name
+
+      - name: 打包 zip 并校验 PE 架构
+        id: pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseDir = 'build\windows\arm64\runner\Release'
+          if (-not (Test-Path $releaseDir)) { throw "未找到 ARM64 产物目录 $releaseDir" }
+
+          $exe = Join-Path $releaseDir 'venera.exe'
+          $bytes   = [IO.File]::ReadAllBytes($exe)
+          $peOff   = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          Write-Host ("venera.exe PE machine = 0x{0:X4}" -f $machine)
+          if ($machine -ne 0xAA64) { throw ("产物不是 ARM64（machine=0x{0:X4}），构建失败" -f $machine) }
+          foreach ($dll in 'flutter_windows.dll') {
+            $p = Join-Path $releaseDir $dll
+            $b = [IO.File]::ReadAllBytes($p); $o = [BitConverter]::ToInt32($b, 0x3C)
+            Write-Host ("{0} machine = 0x{1:X4}" -f $dll, [BitConverter]::ToUInt16($b, $o + 4))
+          }
+
+          $ver = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9.]+)').Matches[0].Groups[1].Value
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          New-Item -ItemType Directory -Force build\dist | Out-Null
+          $zipPath = "build\dist\Venera-$ver-windows-arm64.zip"
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath $zipPath -CompressionLevel Optimal
+          Write-Host ("zip: {0} ({1:N1} MB)" -f $zipPath, ((Get-Item $zipPath).Length / 1MB))
+
+      - name: 构建安装包（可选）
+        if: ${{ inputs.build_installer == 'true' }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            $iscc = (Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).FullName
+          }
+          if (-not $iscc) { Write-Warning '未找到 ISCC.exe，跳过安装包'; exit 0 }
+          Write-Host "使用 $iscc"
+
+          $ver = $env:VERSION
+          $iss = 'windows\build_arm64.iss'
+          $orig = Get-Content $iss -Raw
+          $patched = $orig.Replace('{{version}}', $ver).Replace('{{root_path}}', (Get-Location).Path)
+          Set-Content $iss -Value $patched -NoNewline
+          try {
+            & $iscc $iss
+            if ($LASTEXITCODE -ne 0) { throw "ISCC 退出码 $LASTEXITCODE" }
+          } finally {
+            Set-Content $iss -Value $orig -NoNewline
+          }
+          Get-ChildItem build\windows\Venera-*arm64* -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: venera-windows-arm64
+          path: |
+            build/dist/*.zip
+            build/windows/Venera-*arm64*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 摘要
+        shell: pwsh
+        run: |
+          @"
+          ### Windows ARM64 构建完成
+          - Flutter: ${{ inputs.flutter_version }} (native arm64 Dart ${{ inputs.dart_version }})
+          - 版本: $env:VERSION
+          - 产物: build/dist/Venera-$env:VERSION-windows-arm64.zip
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
