@@ -117,6 +117,35 @@ jobs:
           $env:Path = "$env:FLUTTER_HOME\bin;$env:Path"
           flutter pub get
 
+      - name: 修补 cargokit 的符号链接解析脚本
+        shell: pwsh
+        run: |
+          # cargokit 的 cmake/resolve_symlinks.ps1 逐个路径段调用 Get-Item，但 Windows 下
+          # 对隐藏目录（如 C:\Users\<user>\AppData）不加 -Force 就会抛 "找不到项"，
+          # 导致 rhttp_cargokit 的自定义构建以 -1 退出。这里改成带 -Force 且容错的写法。
+          $ErrorActionPreference = 'Stop'
+          $cache = if ($env:PUB_CACHE) { $env:PUB_CACHE } else { Join-Path $env:LOCALAPPDATA 'Pub\Cache' }
+          Write-Host "PUB_CACHE = $cache"
+
+          $files = @(Get-ChildItem -Path $cache -Recurse -Filter 'resolve_symlinks.ps1' -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -like '*cargokit*' })
+          if ($files.Count -eq 0) { Write-Warning '未找到 cargokit 的 resolve_symlinks.ps1，跳过'; exit 0 }
+
+          $rep = { param($m) 'Get-Item -LiteralPath $realPath -Force -ErrorAction SilentlyContinue' }
+          foreach ($f in $files) {
+            $c = Get-Content $f.FullName -Raw
+            if ($c -match '-LiteralPath \$realPath -Force') { Write-Host "已修补过: $($f.FullName)"; continue }
+            $new = [regex]::Replace($c, 'Get-Item\s+\$realPath', $rep)
+            if ($new -eq $c) { Write-Warning "未匹配到目标语句: $($f.FullName)"; continue }
+            Set-Content $f.FullName -Value $new -NoNewline
+            Write-Host "已修补: $($f.FullName)"
+          }
+
+          # 冒烟测试：用包含隐藏目录的路径跑一遍，确认不再报错且能输出路径
+          $probe = & $files[0].FullName $cache
+          Write-Host "冒烟测试结果: [$probe]"
+          if (-not $probe) { throw 'resolve_symlinks.ps1 修补后仍无法解析路径' }
+
       - name: flutter build windows --release
         shell: pwsh
         run: |
